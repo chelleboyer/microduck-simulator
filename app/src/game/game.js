@@ -49,6 +49,7 @@ import { haptics } from "./haptics.js";
 import { TouchSource } from "./controls/touch.js";
 import { WaypointSource } from "./controls/waypoint.js";
 import * as fx from "./fx/fx-wireframe.js";
+import { createWaypointMarker } from "./fx/waypoint-marker.js";
 import { createCeremony, CAM_RESET_S } from "./ceremony.js";
 import {
   audioCtx, busNode, preloadSfx, playSfx, playUrl, updateListener,
@@ -1463,15 +1464,11 @@ async function boot({ scene, camera, renderer }) {
   window.addEventListener("pointerup", endGrab);
   window.addEventListener("pointercancel", endGrab);
 
-  // Waypoint marker: pulsing ring at the clicked floor point, hidden while
-  // idle. Positioned each frame in frame() from waypointSource.target.
-  const waypointMarker = new THREE.Mesh(
-    new THREE.RingGeometry(0.05, 0.065, 32),
-    new THREE.MeshBasicMaterial({ color: 0xff7a2f, transparent: true, opacity: 0.85, side: THREE.DoubleSide }),
-  );
-  waypointMarker.rotation.x = -Math.PI / 2; // flat on the floor, three y-up
-  waypointMarker.visible = false;
-  scene.add(waypointMarker);
+  // Waypoint marker: hairline tron reticle at the clicked floor point
+  // (fx/waypoint-marker.js), with acquire/arrive animations. Driven each
+  // frame in frame() from waypointSource.target.
+  const waypointMarker = createWaypointMarker();
+  scene.add(waypointMarker.group);
 
   // Pause: while the menu is up over a live game, keys belong to the menu.
   const setInputLock = (v) => { inputLocked = v; controller.setLocked(v); };
@@ -1791,12 +1788,7 @@ async function boot({ scene, camera, renderer }) {
     updateChaseCam();
     ceremony.drive();
     ball.drive(() => spawnBall({ fromQueue: true }));
-    const wpTarget = waypointSource.target;
-    waypointMarker.visible = !!wpTarget;
-    if (wpTarget) {
-      waypointMarker.position.set(wpTarget[0], 0.012, -wpTarget[1]); // MJCF -> three
-      waypointMarker.scale.setScalar(1 + 0.15 * Math.sin(performance.now() * 0.006));
-    }
+    waypointMarker.update(dt, waypointSource.target);
     renderTelemetry();
   }
 
