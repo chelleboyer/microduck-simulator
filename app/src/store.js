@@ -29,6 +29,11 @@ export const useGame = create(
     locoSwitching: false,
     rollersLoading: false, // OSD line while the roller stack streams in
     variant: "classic",
+    // Community walk policy: null = official walker. Written by the game
+    // (game.js loadCustomPolicyIntoGame / the watchdog) and by App.jsx for
+    // the boot-time ?policy= request.
+    // { ref, name, status: "loading"|"active"|"error", error?, revertReason? }
+    customPolicy: null,
     padConnected: false,
     touchMode: false,
     ballActive: false,

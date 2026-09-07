@@ -41,6 +41,16 @@ export default function App() {
     window.addEventListener("touchstart", armTouch, { once: true, passive: true });
     if (params.get("touch") === "1") armTouch();
 
+    // ?policy=<org/repo or .onnx URL>: request a community walk policy.
+    // Only the request is recorded here; the game loads it after boot
+    // (never blocking it) and flips the status to active/error itself.
+    const policyRef = params.get("policy");
+    if (policyRef) {
+      useGame.setState({
+        customPolicy: { ref: policyRef, name: policyRef, status: "loading" },
+      });
+    }
+
     // The title menu opens right away and holds its own loading gate
     // (central spinner) until logo, fonts, duck stage and game boot are
     // in. ?boot=1 skips the title entirely - testing hook.

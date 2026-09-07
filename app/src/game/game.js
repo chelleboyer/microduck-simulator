@@ -57,6 +57,7 @@ import {
   playPropSweep, playLineBlip, setRumble,
 } from "./audio.js";
 import { createBallActor } from "./ball-actor.js";
+import { loadCustomPolicy as loadCustomPolicyModule } from "./custom-policy.js";
 import { initGhosts } from "./ghosts.js";
 import { makeInfiniteGrid, makeArenaWalls } from "./arena.js";
 import { createBallVisual } from "./ball-visual.js";
@@ -351,6 +352,74 @@ async function boot({ scene, camera, renderer }) {
     throw err;
   }
   donePolicies("7/7");
+
+  // ── Community policy slot (walk only) ─────────────────────────────────
+  // A validated Hub policy can replace sessions.walk; every other slot
+  // (recovery, sitstand, kicks, roulade, rollers) stays official. The
+  // official walker is pinned here so a swap is always reversible.
+  const officialWalk = sessions.walk;
+  let customPolicy = null; // { session, name, ref, actionScale }
+  // Watchdog: abnormal-ending timestamps (recovery entries + solver
+  // explosions) while a custom policy drives the duck. 3 within a rolling
+  // 20 s window auto-reverts; ~10 s without a new event clears the slate
+  // so player-caused falls don't slowly accumulate into a revert.
+  const WATCHDOG_WINDOW_MS = 20000;
+  const WATCHDOG_LIMIT = 3;
+  const WATCHDOG_HEALTHY_MS = 10000;
+  let watchdogEvents = [];
+
+  const actionScaleFor = (session) =>
+    (customPolicy && session === customPolicy.session ? customPolicy.actionScale : ACTION_SCALE);
+
+  function revertCustomPolicy(revertReason = null) {
+    if (!customPolicy) return;
+    const prev = customPolicy;
+    customPolicy = null;
+    watchdogEvents = [];
+    sessions.walk = officialWalk;
+    if (revertReason) {
+      console.warn(`[policy] reverted "${prev.name}": ${revertReason}`);
+      setStore({
+        customPolicy: { ref: prev.ref, name: prev.name, status: "error", revertReason },
+      });
+    } else {
+      setStore({ customPolicy: null });
+    }
+  }
+
+  function watchdogAbnormalEnd(kind) {
+    if (!customPolicy) return;
+    const now = performance.now();
+    watchdogEvents.push(now);
+    watchdogEvents = watchdogEvents.filter((t) => now - t < WATCHDOG_WINDOW_MS);
+    if (watchdogEvents.length >= WATCHDOG_LIMIT) {
+      revertCustomPolicy(`${watchdogEvents.length} ${kind === "exploded" ? "explosions/falls" : "falls"} in ${Math.round(WATCHDOG_WINDOW_MS / 1000)} s`);
+    }
+  }
+
+  // One load at a time; a failure (or a bogus boot-time ?policy=) leaves
+  // the official walker untouched and surfaces the error in the store.
+  let policyLoadBusy = false;
+  async function loadCustomPolicyIntoGame(ref) {
+    if (policyLoadBusy) return;
+    policyLoadBusy = true;
+    setStore({ customPolicy: { ref: String(ref), name: String(ref), status: "loading" } });
+    try {
+      const loaded = await loadCustomPolicyModule(ref, { ort });
+      revertCustomPolicy(); // drop any previous custom walker first
+      customPolicy = loaded;
+      watchdogEvents = [];
+      sessions.walk = loaded.session;
+      setStore({ customPolicy: { ref: loaded.ref, name: loaded.name, status: "active" } });
+      console.info(`[policy] custom walk policy active: ${loaded.name} (${loaded.ref})`);
+    } catch (e) {
+      const error = e?.message || String(e);
+      console.warn(`[policy] load failed for "${ref}":`, e);
+      setStore({ customPolicy: { ref: String(ref), name: String(ref), status: "error", error } });
+    } finally {
+      policyLoadBusy = false;
+    }
+  }
 
   const doneCompile = bootLine("COMPILING PHYSICS");
   let model, data;
@@ -865,12 +934,31 @@ async function boot({ scene, camera, renderer }) {
     // Settle phase: ctrl frozen on the pose held at the fall (approximates
     // the runtime's limp beat), physics keeps stepping, no inference.
     if (recovery?.state !== "fallen") {
-      const feeds = { obs: new ort.Tensor("float32", buildObs(), [1, OBS_SIZE]) };
-      const out = await activeSession().run(feeds);
-      const act = out.actions.data;
-      lastAction.set(act);
-      const ctrl = data.ctrl;
-      for (let j = 0; j < NUM_JOINTS; j++) ctrl[j] = DEFAULT_POSE[j] + act[j] * ACTION_SCALE;
+      // Tensor names come from the session itself (community exports don't
+      // all use obs/actions), and the action scale is per-session (official
+      // policies stay at ACTION_SCALE = 1).
+      const session = activeSession();
+      const feeds = {
+        [session.inputNames[0]]: new ort.Tensor("float32", buildObs(), [1, OBS_SIZE]),
+      };
+      const out = await session.run(feeds);
+      const act = out[session.outputNames[0]].data;
+      let finite = true;
+      for (let j = 0; j < NUM_JOINTS; j++) {
+        if (!Number.isFinite(act[j])) { finite = false; break; }
+      }
+      if (!finite) {
+        // Never write a NaN/Inf into ctrl. A custom policy producing one is
+        // instantly reverted; ctrl holds the previous step's targets.
+        if (customPolicy && session === customPolicy.session) {
+          revertCustomPolicy("non-finite action tensor");
+        }
+      } else {
+        const scale = actionScaleFor(session);
+        lastAction.set(act);
+        const ctrl = data.ctrl;
+        for (let j = 0; j < NUM_JOINTS; j++) ctrl[j] = DEFAULT_POSE[j] + act[j] * scale;
+      }
     }
     for (let s = 0; s < DECIMATION; s++) {
       applyGrabForce(); // mouse perturbation, fresh velocity every substep
@@ -878,9 +966,20 @@ async function boot({ scene, camera, renderer }) {
     }
     stepAudioSim(); // footsteps / rumble / ball thumps off the fresh state
 
+    // Watchdog housekeeping: a healthy stretch (no abnormal ending for
+    // ~10 s) forgives earlier events, so player-caused falls spread over
+    // a session never accumulate into a revert.
+    if (customPolicy && watchdogEvents.length &&
+        performance.now() - watchdogEvents[watchdogEvents.length - 1] > WATCHDOG_HEALTHY_MS) {
+      watchdogEvents = [];
+    }
+
     const death = poseIsDead();
     if (death === "exploded") {
       haptics.pulse("explode");
+      // Solver explosions only implicate the custom policy while it is the
+      // one driving (legs walk); one-shots and rollers stay official.
+      if (loco === "legs" && mode === "walk") watchdogAbnormalEnd("exploded");
       resetSim();
     } else if (recovery) {
       // Recovery state machine owns the duck: settle -> stand policy ->
@@ -912,6 +1011,9 @@ async function boot({ scene, camera, renderer }) {
         if (++fallDebounce >= FALL_DEBOUNCE_STEPS) {
           fallDebounce = 0;
           exitHeadMode();
+          // Recovery entry = one abnormal ending for the custom-policy
+          // watchdog (the rolling window absorbs player-caused falls).
+          watchdogAbnormalEnd("fallen");
           recovery = { state: "fallen", steps: 0 };
           // Haptic thud on the confirmed fall (one-shot: this transition
           // fires once per fall, the recovery machine owns the duck after).
@@ -1988,6 +2090,8 @@ async function boot({ scene, camera, renderer }) {
     resetSim,
     spawnBall: () => spawnBall(),
     startEntrance: () => ceremony.startEntrance(),
+    loadCustomPolicy: (ref) => loadCustomPolicyIntoGame(ref),
+    clearCustomPolicy: () => revertCustomPolicy(),
   });
 
   // Deterministic hooks for automated verification (rAF pauses in
@@ -2002,6 +2106,10 @@ async function boot({ scene, camera, renderer }) {
     velCmd: kbSource.command, lastAction, resetSim,
     controller, kbSource, padSource,
     spawnBall, triggerKick, triggerRoll, sessions, ort,
+    loadCustomPolicy: loadCustomPolicyIntoGame,
+    clearCustomPolicy: revertCustomPolicy,
+    get customPolicy() { return customPolicy; },
+    get watchdogEvents() { return watchdogEvents.slice(); },
     get loco() { return loco; },
     get locoSwitching() { return locoSwitching; },
     toggleLoco, setLoco, ensureRollers,
@@ -2055,6 +2163,14 @@ async function boot({ scene, camera, renderer }) {
   // the user already waddled in, or when they do) sees bootDone and closes
   // with READY. + fade on its own.
   setStore({ bootDone: true });
+
+  // ?policy=<ref> (parsed in App.jsx into the store): load the community
+  // policy now that the sim is up. Fire-and-forget - a bad ref surfaces
+  // its error in the HUD while the official walker keeps the duck alive.
+  const requestedPolicy = store().customPolicy;
+  if (requestedPolicy?.status === "loading" && requestedPolicy.ref) {
+    loadCustomPolicyIntoGame(requestedPolicy.ref);
+  }
 
   // ── Multiplayer ghosts (WebRTC, serverless signaling) ────────────────
   // Broadcast this duck's pose and render up to 3 other visitors live as

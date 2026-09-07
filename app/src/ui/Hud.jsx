@@ -403,10 +403,59 @@ function Quickbar() {
           })}
         </Box>
       </HudPlate>
+      <PolicyChip />
       {/* Sound is fully disabled for now (SOUND_DISABLED in audio.js) -
           the mute toggle comes back with the finished sound design. */}
       {/* <SoundToggle /> */}
     </Box>
+  );
+}
+
+// Active community policy chip: rides the quickbar row in the same panel
+// language. Shows the policy's name and an X that swaps the official
+// walker back in (gameApi.clearCustomPolicy).
+function PolicyChip() {
+  const cp = useGame((s) => s.customPolicy);
+  if (cp?.status !== "active") return null;
+  return (
+    <HudPlate caption="Policy" captionFill="orange">
+      <Box sx={{ display: "inline-flex", alignItems: "stretch", height: "100%" }}>
+        <Box
+          sx={{
+            ...hudHitSx,
+            px: "0.85rem",
+            cursor: "default",
+            color: ORANGE,
+            maxWidth: "14rem",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            display: "inline-block",
+            lineHeight: `${CELL_H}px`,
+          }}
+          title={cp.ref}
+        >
+          {cp.name}
+        </Box>
+        <Box
+          component="button"
+          type="button"
+          aria-label={`Unload policy ${cp.name}`}
+          onClick={() => { uiClick(); gameApi.clearCustomPolicy?.(); }}
+          sx={{
+            ...hudHitSx,
+            px: "0.6rem",
+            color: "rgba(250, 248, 242, 0.72)",
+            "&:hover": {
+              color: ORANGE,
+              background: "rgba(255, 122, 47, 0.12)",
+            },
+            "&:active": { filter: "brightness(0.92)" },
+          }}
+        >
+          {"\u2715"}
+        </Box>
+      </Box>
+    </HudPlate>
   );
 }
 
@@ -480,7 +529,11 @@ function Telemetry() {
 
 function OsdLoad() {
   const rollersLoading = useGame((s) => s.rollersLoading);
-  if (!rollersLoading) return null;
+  const policyLoading = useGame((s) => s.customPolicy?.status === "loading");
+  const lines = [];
+  if (rollersLoading) lines.push("LOADING ROLLERS");
+  if (policyLoading) lines.push("LOADING POLICY");
+  if (!lines.length) return null;
   return (
     <Box
       sx={{
@@ -493,15 +546,64 @@ function OsdLoad() {
         letterSpacing: "0.14em",
         color: ORANGE,
         textShadow: "0 0 8px rgba(255, 122, 47, 0.4)",
+        textAlign: "right",
+        lineHeight: 1.9,
       }}
     >
-      LOADING ROLLERS
-      <Box
-        component="span"
-        sx={{ display: "inline-block", ml: "0.15em", animation: `${recBlink} 0.8s steps(1) infinite` }}
-      >
-        {"\u2588"}
-      </Box>
+      {lines.map((l) => (
+        <Box key={l}>
+          {l}
+          <Box
+            component="span"
+            sx={{ display: "inline-block", ml: "0.15em", animation: `${recBlink} 0.8s steps(1) infinite` }}
+          >
+            {"\u2588"}
+          </Box>
+        </Box>
+      ))}
+    </Box>
+  );
+}
+
+// Toast-style OSD line for policy failures: a load error or a watchdog
+// revert paints below the loading line for a few seconds, then clears the
+// store slot (the official walker is already back by then).
+function PolicyToast() {
+  const cp = useGame((s) => s.customPolicy);
+  const isError = cp?.status === "error";
+  useEffect(() => {
+    if (!isError) return;
+    const t = setTimeout(() => {
+      if (useGame.getState().customPolicy === cp) {
+        useGame.setState({ customPolicy: null });
+      }
+    }, 9000);
+    return () => clearTimeout(t);
+  }, [cp, isError]);
+  if (!isError) return null;
+  const msg = cp.revertReason
+    ? `POLICY REVERTED \u00b7 ${cp.revertReason}`
+    : `POLICY LOAD FAILED \u00b7 ${cp.error ?? "unknown error"}`;
+  return (
+    <Box
+      role="alert"
+      sx={{
+        position: "fixed",
+        top: "7.4rem",
+        right: "1.5rem",
+        zIndex: 10,
+        maxWidth: "24rem",
+        fontFamily: MONO,
+        fontSize: "0.66rem",
+        letterSpacing: "0.1em",
+        textTransform: "uppercase",
+        textAlign: "right",
+        lineHeight: 1.7,
+        color: "#ff4b3a",
+        textShadow: "0 0 8px rgba(255, 75, 58, 0.45)",
+      }}
+    >
+      {msg}
     </Box>
   );
 }
@@ -520,6 +622,7 @@ export default function Hud() {
           <Quickbar />
           <Telemetry />
           <OsdLoad />
+          <PolicyToast />
         </>
       )}
     </>
