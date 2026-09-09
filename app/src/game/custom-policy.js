@@ -52,10 +52,21 @@ export function manifestIncompatibility(manifest) {
 }
 
 // A policy ref is either an org/repo Hub id or a direct URL to a .onnx.
+// A direct URL may sit next to a manifest.json (the Academy's private-policy
+// handoff serves both under one capability URL): it is probed best-effort.
 export function resolvePolicyRef(ref) {
   const r = String(ref || "").trim();
   if (/^https?:\/\//i.test(r)) {
-    return { kind: "url", name: r.split("/").pop() || r, onnxUrl: r, manifestUrl: null };
+    let manifestUrl = null;
+    try {
+      const u = new URL(r);
+      const name = u.pathname.split("/").pop() || "";
+      if (/\.onnx$/i.test(name)) {
+        u.pathname = u.pathname.slice(0, -name.length) + "manifest.json";
+        manifestUrl = u.href;
+      }
+    } catch { /* unparsable: no manifest probe */ }
+    return { kind: "url", name: r.split("/").pop()?.split("?")[0] || r, onnxUrl: r, manifestUrl, manifestOptional: true };
   }
   if (!/^[\w.-]+\/[\w.-]+$/.test(r)) {
     throw new Error(`invalid policy ref "${r}" (expected org/repo or a .onnx URL)`);
@@ -126,12 +137,22 @@ export async function loadCustomPolicy(ref, { ort, onProgress = () => {} } = {})
   if (resolved.manifestUrl) {
     onProgress("manifest");
     let manifest = null;
-    try {
-      manifest = await fetchPolicyManifest(resolved.repoId);
-    } catch (e) {
-      // TypeError = the fetch itself failed (offline, CORS); anything else
-      // already carries a specific message (missing repo, bad status).
-      throw e instanceof TypeError ? new Error(`could not reach the Hub: ${e.message}`) : e;
+    if (resolved.manifestOptional) {
+      // Sibling manifest of a direct URL: any failure (404, CORS, bad JSON)
+      // just means "no manifest", exactly like before the probe existed.
+      // Only a present-and-incompatible manifest rejects below.
+      try {
+        const res = await fetch(resolved.manifestUrl);
+        if (res.ok) manifest = await res.json();
+      } catch { manifest = null; }
+    } else {
+      try {
+        manifest = await fetchPolicyManifest(resolved.repoId);
+      } catch (e) {
+        // TypeError = the fetch itself failed (offline, CORS); anything else
+        // already carries a specific message (missing repo, bad status).
+        throw e instanceof TypeError ? new Error(`could not reach the Hub: ${e.message}`) : e;
+      }
     }
     if (manifest) {
       const reason = manifestIncompatibility(manifest);

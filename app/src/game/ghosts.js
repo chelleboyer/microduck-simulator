@@ -56,6 +56,24 @@ const BUF_MAX = 40; // snapshots kept per ghost (~2.5 s at 15 Hz)
 // Floor between legs<->rollers ghost rebuilds for one peer: a rebuild
 // clones a full rig, so the rate is capped against flag-flapping peers.
 const LOCO_SWAP_MIN_MS = 500;
+// Hopeless-stream gate: a ghost whose snapshots arrive too sparsely to
+// interpolate smoothly (peer tab throttled to ~1 Hz, bad network) is
+// faded out entirely instead of shown as a stuttering slow-motion puppet.
+// Health is judged on max(gapAvg, time since last packet) with hysteresis:
+// sustained above HIDE_GAP_MS hides, sustained below SHOW_GAP_MS shows,
+// and the band between the two keeps the current state so the boundary
+// never flickers. The sustain windows also ride out one-off hiccups
+// (gapAvg fast-attacks on a single late packet but releases within a few
+// packets, well inside HIDE_SUSTAIN_MS). Fading drives the cloned ghost
+// materials' opacity (same path as GHOST_OPACITY), the ghost ball, and
+// the mapDots minimap feed; ghosts have no name tags or audio emitters,
+// so there is nothing else to mute.
+const HIDE_GAP_MS = 700; // sustained arrival interval that hides a ghost
+const SHOW_GAP_MS = 350; // sustained interval that shows it again
+const HIDE_SUSTAIN_MS = 1500; // how long the gap must stay bad to hide
+const SHOW_SUSTAIN_MS = 700; // how long it must stay good to show
+const FADE_MS = 400; // opacity ramp duration for hide/show
+
 // Idle visitors stay invisible: a ghost is only shown once its peer has
 // strayed from the pose of its first state message (everyone spawns at
 // the arena center). Once revealed it stays visible for the whole peer
@@ -87,6 +105,7 @@ export async function initGhosts(env) {
   const noop = {
     update() {}, peerCount: () => 0, ghostCount: () => 0, debug: () => [],
     mapDots: () => [], destroy() {}, injectState: () => false,
+    setSendHz: () => {},
   };
   let room;
   try {
@@ -218,6 +237,12 @@ export async function initGhosts(env) {
       ball: null, // { group, mesh } lazily built on the first ball pose
       gapAvg: 1000 / SEND_HZ, // measured arrival cadence, ms
       delay: INTERP_DELAY_MS, // current playback delay, ms
+      // Stream-health fade (see HIDE_GAP_MS block): fade is the current
+      // opacity factor, fadeTarget the hysteresis verdict (0 or 1), and
+      // appliedFade what the materials last received (fresh ghostify
+      // clones start at full GHOST_OPACITY, i.e. factor 1).
+      fade: 1, fadeTarget: 1, appliedFade: 1,
+      hideSince: null, showSince: null,
     };
   };
 
@@ -313,10 +338,14 @@ export async function initGhosts(env) {
       if (servedLoco(state.l) !== state.l) {
         env.prepareRigFor?.(state.l);
       } else if (now - (g.locoSwapAt ?? 0) >= LOCO_SWAP_MIN_MS) {
-        const { lastSeen, spawn, revealed, buf, gapAvg, delay } = g;
+        const { lastSeen, spawn, revealed, buf, gapAvg, delay,
+          fade, fadeTarget, hideSince, showSince } = g;
         removeGhost(peerId);
         g = makeGhost(state);
-        Object.assign(g, { lastSeen, spawn, revealed, buf, gapAvg, delay, locoSwapAt: now });
+        // appliedFade stays 1 (fresh rig materials): update() re-applies
+        // the carried fade on the next frame if it differs.
+        Object.assign(g, { lastSeen, spawn, revealed, buf, gapAvg, delay,
+          fade, fadeTarget, hideSince, showSince, locoSwapAt: now });
         g.rig.placer.visible = revealed;
         ghosts.set(peerId, g);
         return;
@@ -326,6 +355,7 @@ export async function initGhosts(env) {
       g.variant = state.v;
       applyVariant(g.rig, state.v);
       ghostify(g.rig);
+      g.appliedFade = 1; // repaint recloned materials at full GHOST_OPACITY
     }
   };
   const onState = (state, { peerId }) => {
@@ -374,17 +404,26 @@ export async function initGhosts(env) {
   };
   let tickWorker = null;
   let tickId = null;
-  try {
-    const url = URL.createObjectURL(new Blob(
-      [`setInterval(() => postMessage(0), ${1000 / SEND_HZ});`],
-      { type: "text/javascript" },
-    ));
-    tickWorker = new Worker(url);
-    URL.revokeObjectURL(url); // the worker resolved the URL synchronously
-    tickWorker.onmessage = tick;
-  } catch {
-    tickId = setInterval(tick, 1000 / SEND_HZ);
-  }
+  // Broadcast ticker, restartable so the QA hook below can emulate a
+  // throttled sender (there is no other way to reach the worker's
+  // interval from the console once it is running).
+  const startTicker = (hz) => {
+    tickWorker?.terminate();
+    tickWorker = null;
+    if (tickId !== null) { clearInterval(tickId); tickId = null; }
+    try {
+      const url = URL.createObjectURL(new Blob(
+        [`setInterval(() => postMessage(0), ${1000 / hz});`],
+        { type: "text/javascript" },
+      ));
+      tickWorker = new Worker(url);
+      URL.revokeObjectURL(url); // the worker resolved the URL synchronously
+      tickWorker.onmessage = tick;
+    } catch {
+      tickId = setInterval(tick, 1000 / hz);
+    }
+  };
+  startTicker(SEND_HZ);
 
   // Scratch THREE.Quaternions without importing three: slerp needs real
   // instances, cloned here from any node of the already-built local rig.
@@ -416,7 +455,7 @@ export async function initGhosts(env) {
       scene.add(ball.group);
       g.ball = ball;
     }
-    g.ball.group.visible = g.revealed;
+    g.ball.group.visible = g.revealed && g.fade > 0;
     const mesh = g.ball.mesh;
     if (ab && bb) {
       mesh.position.set(
@@ -432,6 +471,20 @@ export async function initGhosts(env) {
       mesh.position.set(s[0], s[1], s[2]);
       mesh.quaternion.set(s[4], s[5], s[6], s[3]);
     }
+  };
+  // Push the ghost's current fade factor into its cloned materials (beauty
+  // meshes + ghost ball; prepass twins are colorWrite-off so opacity is
+  // irrelevant, and the whole rig is hidden via placer.visible at fade 0).
+  // Called only on frames where the fade actually moved.
+  const applyFade = (g) => {
+    const seen = new Set();
+    g.rig.root.traverse((o) => {
+      if (!o.isMesh || o.userData.ghostPrepass || seen.has(o.material.uuid)) return;
+      seen.add(o.material.uuid);
+      o.material.opacity = GHOST_OPACITY * g.fade;
+    });
+    if (g.ball) g.ball.mesh.material.opacity = GHOST_OPACITY * g.fade;
+    g.appliedFade = g.fade;
   };
   let lastUpdateAt = performance.now(); // update() frame clock for the delay slew
   const api = {
@@ -451,13 +504,17 @@ export async function initGhosts(env) {
     // Debug/test hook: feed a payload through the exact same guarded path
     // as a network message (console QA of the validation layer).
     injectState: (state, peerId = "__debug") => onState(state, { peerId }),
+    // QA hook: rebuild the broadcast ticker at a different rate, to
+    // emulate a background-throttled / bad-network sender (drives the
+    // receiving side's sparse-stream fade, see HIDE_GAP_MS block).
+    setSendHz: (hz = SEND_HZ) => startTicker(hz),
     peerCount: () => Object.keys(room.getPeers()).length,
     ghostCount: () => ghosts.size,
     // Minimap feed: revealed ghosts' arena positions in raw MJCF coords
     // (trunk.position is set from qpos before the root's Z-up fix).
     mapDots: () =>
       [...ghosts.values()]
-        .filter((g) => g.revealed)
+        .filter((g) => g.revealed && g.fade > 0) // fade-hidden ghosts drop off the map too
         .map((g) => ({ x: g.trunk.position.x, y: g.trunk.position.y })),
     debug: () => [...ghosts.entries()].map(([peerId, g]) => {
       let meshes = 0, visible = 0, op = null, twins = 0;
@@ -470,7 +527,7 @@ export async function initGhosts(env) {
       const ball = g.ball
         ? { visible: g.ball.group.visible, p: g.ball.mesh.position.toArray() }
         : null;
-      return { peerId, p: g.trunk.position.toArray(), world: w.toArray(), inScene: !!g.rig.placer.parent, revealed: g.revealed, meshes, visible, twins, op, v: g.variant, l: g.loco, ball, gapAvg: g.gapAvg, delay: g.delay, bufLen: g.buf.length };
+      return { peerId, p: g.trunk.position.toArray(), world: w.toArray(), inScene: !!g.rig.placer.parent, revealed: g.revealed, meshes, visible, twins, op, v: g.variant, l: g.loco, ball, gapAvg: g.gapAvg, delay: g.delay, bufLen: g.buf.length, fade: g.fade, fadeTarget: g.fadeTarget, lastSeen: g.lastSeen };
     }),
     update() {
       const now = performance.now();
@@ -479,6 +536,28 @@ export async function initGhosts(env) {
       const dt = Math.min(250, now - lastUpdateAt);
       lastUpdateAt = now;
       for (const g of ghosts.values()) {
+        // Stream-health verdict with hysteresis (see HIDE_GAP_MS block):
+        // judge on the measured cadence AND the live silence since the
+        // last packet, so a sender that stopped entirely starts fading
+        // before the 5 s stale sweep removes it.
+        const sparse = Math.max(g.gapAvg, now - g.lastSeen);
+        if (sparse > HIDE_GAP_MS) {
+          g.showSince = null;
+          if (g.hideSince === null) g.hideSince = now;
+          else if (now - g.hideSince >= HIDE_SUSTAIN_MS) g.fadeTarget = 0;
+        } else if (sparse < SHOW_GAP_MS) {
+          g.hideSince = null;
+          if (g.showSince === null) g.showSince = now;
+          else if (now - g.showSince >= SHOW_SUSTAIN_MS) g.fadeTarget = 1;
+        } else {
+          g.hideSince = g.showSince = null; // dead band: hold current state
+        }
+        if (g.fade !== g.fadeTarget) {
+          const step = dt / FADE_MS;
+          g.fade += Math.min(step, Math.max(-step, g.fadeTarget - g.fade));
+        }
+        if (g.fade !== g.appliedFade) applyFade(g);
+        g.rig.placer.visible = g.revealed && g.fade > 0;
         // Adaptive playback delay: track the measured arrival cadence with
         // margin, floored at the healthy-peer delay. Slew-limited to half
         // real time so render time never runs backward while the delay
