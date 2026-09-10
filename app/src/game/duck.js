@@ -35,6 +35,12 @@ export async function loadKinematics(url) {
   const r = await fetch(signed(`${url}?v=${MESH_VERSION}`), { cache: "force-cache" });
   if (!r.ok) throw new Error(`kinematics fetch ${r.status}`);
   const k = await r.json();
+  // The exported mesh_dir is root-absolute ("/robot/mjlab/meshes"), which
+  // breaks when the app is served under a prefix (/play/). Rebase it like
+  // every other asset URL (MODEL_DIR is "./robot/mjlab").
+  if (typeof k.mesh_dir === "string" && k.mesh_dir.startsWith("/")) {
+    k.mesh_dir = `.${k.mesh_dir}`;
+  }
   // Full-resolution meshes by default (the reduction will be redone
   // interactively in Blender later). `?lite=1` opts into a decimated
   // meshes-lite/ sibling if present.
