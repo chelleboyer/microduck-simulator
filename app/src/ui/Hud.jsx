@@ -411,14 +411,19 @@ function Quickbar() {
   );
 }
 
-// Active community policy chip: rides the quickbar row in the same panel
-// language. Shows the policy's name and an X that swaps the official
-// walker back in (gameApi.clearCustomPolicy).
+// Active community move chip: rides the quickbar row in the same panel
+// language. "PLAYING: <prompt or name> by <owner>" (Academy moves carry
+// their prompt and author in manifest.academy), a hint on the key that
+// plays a trick / script, and an X that swaps the official slot back in
+// (gameApi.clearCustomPolicy).
 function PolicyChip() {
   const cp = useGame((s) => s.customPolicy);
   if (cp?.status !== "active") return null;
+  const title = cp.title || cp.name;
+  const by = cp.author ? ` by ${cp.author}` : "";
+  const hint = cp.slot === "trick" || cp.slot === "script" || cp.slot === "sitstand" ? " \u00b7 R" : "";
   return (
-    <HudPlate caption="Policy" captionFill="orange">
+    <HudPlate caption="Playing" captionFill="orange">
       <Box sx={{ display: "inline-flex", alignItems: "stretch", height: "100%" }}>
         <Box
           sx={{
@@ -426,20 +431,20 @@ function PolicyChip() {
             px: "0.85rem",
             cursor: "default",
             color: ORANGE,
-            maxWidth: "14rem",
+            maxWidth: "22rem",
             overflow: "hidden",
             textOverflow: "ellipsis",
             display: "inline-block",
             lineHeight: `${CELL_H}px`,
           }}
-          title={cp.ref}
+          title={`${cp.ref}${cp.kind ? ` (${cp.kind})` : ""}`}
         >
-          {cp.name}
+          {`${title}${by}${hint}`}
         </Box>
         <Box
           component="button"
           type="button"
-          aria-label={`Unload policy ${cp.name}`}
+          aria-label={`Unload move ${cp.name}`}
           onClick={() => { uiClick(); gameApi.clearCustomPolicy?.(); }}
           sx={{
             ...hudHitSx,
@@ -532,7 +537,7 @@ function OsdLoad() {
   const policyLoading = useGame((s) => s.customPolicy?.status === "loading");
   const lines = [];
   if (rollersLoading) lines.push("LOADING ROLLERS");
-  if (policyLoading) lines.push("LOADING POLICY");
+  if (policyLoading) lines.push("LOADING MOVE");
   if (!lines.length) return null;
   return (
     <Box
@@ -582,8 +587,8 @@ function PolicyToast() {
   }, [cp, isError]);
   if (!isError) return null;
   const msg = cp.revertReason
-    ? `POLICY REVERTED \u00b7 ${cp.revertReason}`
-    : `POLICY LOAD FAILED \u00b7 ${cp.error ?? "unknown error"}`;
+    ? `MOVE REVERTED \u00b7 ${cp.revertReason}`
+    : `MOVE LOAD FAILED \u00b7 ${cp.error ?? "unknown error"}`;
   return (
     <Box
       role="alert"

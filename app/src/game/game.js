@@ -57,7 +57,7 @@ import {
   playPropSweep, playLineBlip, setRumble,
 } from "./audio.js";
 import { createBallActor } from "./ball-actor.js";
-import { loadCustomPolicy as loadCustomPolicyModule } from "./custom-policy.js";
+import { loadCustomPolicy as loadCustomPolicyModule, scriptCommandAt } from "./custom-policy.js";
 import { initGhosts } from "./ghosts.js";
 import { makeInfiniteGrid, makeArenaWalls } from "./arena.js";
 import { createBallVisual } from "./ball-visual.js";
@@ -353,12 +353,21 @@ async function boot({ scene, camera, renderer }) {
   }
   donePolicies("7/7");
 
-  // ── Community policy slot (walk only) ─────────────────────────────────
-  // A validated Hub policy can replace sessions.walk; every other slot
-  // (recovery, sitstand, kicks, roulade, rollers) stays official. The
-  // official walker is pinned here so a swap is always reversible.
+  // ── Community move slots ──────────────────────────────────────────────
+  // A validated move mounts according to its manifest (Academy D7):
+  //   perpetual -> sessions.walk (default) or sessions.sitstand (R key)
+  //   episodic  -> sessions.roll, played as a one-shot "trick" on R
+  //   script    -> a 13-D command timeline on the walker, toggled by R
+  // Every other slot (recovery, kicks, rollers) stays official. The
+  // official sessions are pinned here so a swap is always reversible.
   const officialWalk = sessions.walk;
-  let customPolicy = null; // { session, name, ref, actionScale }
+  const officialSitstand = sessions.sitstand;
+  const officialRoll = sessions.roll;
+  let customPolicy = null; // loadCustomPolicy result: { kind, slot, session?, script?, ... }
+  let scriptRun = null; // { t } while a kind "script" move drives the commands
+  // True while the custom session is the one producing this step's actions.
+  const customDriving = () =>
+    !!(customPolicy?.session && activeSession() === customPolicy.session);
   // Watchdog: abnormal-ending timestamps (recovery entries + solver
   // explosions) while a custom policy drives the duck. 3 within a rolling
   // 20 s window auto-reverts; ~10 s without a new event clears the slate
@@ -375,17 +384,26 @@ async function boot({ scene, camera, renderer }) {
     if (!customPolicy) return;
     const prev = customPolicy;
     customPolicy = null;
+    scriptRun = null;
     watchdogEvents = [];
     sessions.walk = officialWalk;
+    sessions.sitstand = officialSitstand;
+    sessions.roll = officialRoll;
     if (revertReason) {
       console.warn(`[policy] reverted "${prev.name}": ${revertReason}`);
       setStore({
-        customPolicy: { ref: prev.ref, name: prev.name, status: "error", revertReason },
+        customPolicy: { ...storeMove(prev), status: "error", revertReason },
       });
     } else {
       setStore({ customPolicy: null });
     }
   }
+
+  // Store projection of a loaded move (no session / script objects in React).
+  const storeMove = (m) => ({
+    ref: m.ref, name: m.name, title: m.title ?? m.name, author: m.author ?? null,
+    kind: m.kind ?? "perpetual", slot: m.slot ?? "walk", academy: m.academy ?? null,
+  });
 
   function watchdogAbnormalEnd(kind) {
     if (!customPolicy) return;
@@ -406,12 +424,15 @@ async function boot({ scene, camera, renderer }) {
     setStore({ customPolicy: { ref: String(ref), name: String(ref), status: "loading" } });
     try {
       const loaded = await loadCustomPolicyModule(ref, { ort });
-      revertCustomPolicy(); // drop any previous custom walker first
+      revertCustomPolicy(); // drop any previous custom move first
       customPolicy = loaded;
       watchdogEvents = [];
-      sessions.walk = loaded.session;
-      setStore({ customPolicy: { ref: loaded.ref, name: loaded.name, status: "active" } });
-      console.info(`[policy] custom walk policy active: ${loaded.name} (${loaded.ref})`);
+      if (loaded.slot === "walk") sessions.walk = loaded.session;
+      else if (loaded.slot === "sitstand") sessions.sitstand = loaded.session;
+      else if (loaded.slot === "trick") sessions.roll = loaded.session;
+      // "script": nothing to swap, the R key starts the command player.
+      setStore({ customPolicy: { ...storeMove(loaded), status: "active" } });
+      console.info(`[policy] custom ${loaded.kind} move active in slot ${loaded.slot}: ${loaded.name} (${loaded.ref})`);
     } catch (e) {
       const error = e?.message || String(e);
       console.warn(`[policy] load failed for "${ref}":`, e);
@@ -633,6 +654,7 @@ async function boot({ scene, camera, renderer }) {
     // Single reset path: Space, fall-kill, failed roll, loco switch.
     clearModeTimers();
     rollRun = null;
+    scriptRun = null;
     kickRun = null;
     crouchRun = null;
     pickRun = null;
@@ -757,6 +779,12 @@ async function boot({ scene, camera, renderer }) {
     const gpZero = mode === "groundpick" || recovery !== null;
     cmd[3] = gpZero ? 0 : headSmooth[0]; cmd[4] = gpZero ? 0 : headSmooth[1];
     cmd[5] = gpZero ? 0 : headSmooth[2]; cmd[6] = gpZero ? 0 : headSmooth[3];
+    // Command script (kind "script" move): the timeline owns the whole
+    // 13-D command vector while it plays on the walker. Movement input is
+    // ignored until R stops it (or the script ends, when it doesn't loop).
+    if (scriptRun && mode === "walk" && !recovery && customPolicy?.script) {
+      scriptCommandAt(customPolicy.script, scriptRun.t, cmd);
+    }
     for (let c = 0; c < CMD_SIZE; c++) obs[i++] = cmd[c];
     return obs;
   }
@@ -966,6 +994,17 @@ async function boot({ scene, camera, renderer }) {
     }
     stepAudioSim(); // footsteps / rumble / ball thumps off the fresh state
 
+    // Command script clock: 50 Hz like everything here. A non-looping
+    // script ends on its own; a looping one runs until R (or a reset).
+    if (scriptRun) {
+      scriptRun.t += CTRL_DT;
+      const sc = customPolicy?.script;
+      if (!sc || (!sc.loop && scriptRun.t >= sc.durationS)) {
+        scriptRun = null;
+        syncButtons();
+      }
+    }
+
     // Watchdog housekeeping: a healthy stretch (no abnormal ending for
     // ~10 s) forgives earlier events, so player-caused falls spread over
     // a session never accumulate into a revert.
@@ -978,8 +1017,9 @@ async function boot({ scene, camera, renderer }) {
     if (death === "exploded") {
       haptics.pulse("explode");
       // Solver explosions only implicate the custom policy while it is the
-      // one driving (legs walk); one-shots and rollers stay official.
-      if (loco === "legs" && mode === "walk") watchdogAbnormalEnd("exploded");
+      // one driving (its slot: walk, sitstand or the trick one-shot);
+      // official one-shots and rollers never count.
+      if (loco === "legs" && customDriving()) watchdogAbnormalEnd("exploded");
       resetSim();
     } else if (recovery) {
       // Recovery state machine owns the duck: settle -> stand policy ->
@@ -1028,7 +1068,12 @@ async function boot({ scene, camera, renderer }) {
         // same haptic thud, once - fallenSince latches until reset/upright.
         if (fallenSince == null) haptics.pulse("fall");
         fallenSince ??= now;
-        if (now - fallenSince > graceMs) resetSim();
+        if (now - fallenSince > graceMs) {
+          // A custom sit / trick that floors the duck counts for the
+          // watchdog exactly like a recovery entry does for a walker.
+          if (loco === "legs" && customDriving()) watchdogAbnormalEnd("fallen");
+          resetSim();
+        }
       }
     } else {
       fallDebounce = 0;
@@ -1089,15 +1134,20 @@ async function boot({ scene, camera, renderer }) {
       if (obs[5] > -0.3) rollRun.tipped = true;
       const upright = obs[5] < -0.85;
       const done = rollRun.tipped && upright && rollRun.steps >= 40;
-      const expired = rollRun.steps >= 150; // 3 s, roll should long be over
+      // 3 s for the official roll (it should long be over); a custom
+      // trick runs for its manifest duration instead.
+      const expired = rollRun.steps >= rollRun.maxSteps;
       if (done || expired) {
+        const wasCustom = rollRun.custom;
         rollRun = null;
         mode = "walk";
         lastAction.fill(0);
         // Timed out mid-roll: don't hand a tipped duck to the walking
         // policy (it has no get-up skill).
-        if (!upright) resetSim();
-        else haptics.pulse("land"); // rolled through and stuck the landing
+        if (!upright) {
+          if (wasCustom) watchdogAbnormalEnd("fallen");
+          resetSim();
+        } else haptics.pulse("land"); // rolled through and stuck the landing
         syncButtons();
       }
     }
@@ -1921,6 +1971,10 @@ async function boot({ scene, camera, renderer }) {
   // the crouch-glide, exactly as the (now unbound) roll action did.
   controller.on("sitToggle", ({ source } = {}) => {
     if (loco !== "legs") return triggerCrouch(srcTag(source));
+    // A community trick / script takes over the R key while it is mounted
+    // (a custom sitstand keeps the sit toggle: it IS the sit policy).
+    if (customPolicy?.slot === "trick") return triggerRoll(srcTag(source));
+    if (customPolicy?.slot === "script") return toggleScript();
     const sitting = mode === "sitstand" && sitFlag === 1;
     setMode(sitting ? "walk" : "sit");
   });
@@ -2009,9 +2063,28 @@ async function boot({ scene, camera, renderer }) {
     clearModeTimers();
     mode = "roll";
     sitFlag = 0;
-    rollRun = { steps: 0, tipped: false };
+    // A custom episodic trick lives in the roll slot and runs for its own
+    // duration (loadCustomPolicy clamps it); the official roulade keeps
+    // its 3 s hard window.
+    const custom = customPolicy?.slot === "trick" && sessions.roll === customPolicy.session;
+    const maxSteps = custom ? Math.max(10, Math.round((customPolicy.durationS ?? 5) / CTRL_DT)) : 150;
+    rollRun = { steps: 0, tipped: false, custom, maxSteps };
     syncButtons();
     stickers?.pop("roll");
+  }
+
+  // Kind "script" move: R toggles the command timeline on the walker.
+  function toggleScript() {
+    if (!customPolicy?.script) return;
+    if (scriptRun) {
+      scriptRun = null;
+      syncButtons();
+      return;
+    }
+    if (inputLocked || mode !== "walk" || standTimer || recovery || loco !== "legs") return;
+    exitHeadMode();
+    scriptRun = { t: 0 };
+    syncButtons();
   }
 
   // Roller-only one-shot: crouch, glide low, stand back up (phase-driven).
@@ -2061,7 +2134,8 @@ async function boot({ scene, camera, renderer }) {
     const sitting = mode === "sitstand" && sitFlag === 1;
     const label =
       recovery ? "Recovery"
-      : mode === "roll" ? "Roll"
+      : mode === "roll" ? (rollRun?.custom ? "Trick" : "Roll")
+      : scriptRun ? "Script"
       : mode === "crouch" ? "Crouch"
       : mode === "groundpick" ? "Pick"
       : isKick() ? "Kick"
@@ -2109,6 +2183,8 @@ async function boot({ scene, camera, renderer }) {
     loadCustomPolicy: loadCustomPolicyIntoGame,
     clearCustomPolicy: revertCustomPolicy,
     get customPolicy() { return customPolicy; },
+    get scriptRun() { return scriptRun; },
+    toggleScript,
     get watchdogEvents() { return watchdogEvents.slice(); },
     get loco() { return loco; },
     get locoSwitching() { return locoSwitching; },
@@ -2164,9 +2240,10 @@ async function boot({ scene, camera, renderer }) {
   // with READY. + fade on its own.
   setStore({ bootDone: true });
 
-  // ?policy=<ref> (parsed in App.jsx into the store): load the community
-  // policy now that the sim is up. Fire-and-forget - a bad ref surfaces
-  // its error in the HUD while the official walker keeps the duck alive.
+  // ?move=<ref> / ?policy=<ref> / ?session=<id> (parsed in App.jsx into the
+  // store): load the community move now that the sim is up. Fire-and-forget
+  // - a bad ref surfaces its error in the HUD while the official walker
+  // keeps the duck alive.
   const requestedPolicy = store().customPolicy;
   if (requestedPolicy?.status === "loading" && requestedPolicy.ref) {
     loadCustomPolicyIntoGame(requestedPolicy.ref);

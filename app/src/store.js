@@ -29,10 +29,12 @@ export const useGame = create(
     locoSwitching: false,
     rollersLoading: false, // OSD line while the roller stack streams in
     variant: "classic",
-    // Community walk policy: null = official walker. Written by the game
+    // Community move: null = all-official slots. Written by the game
     // (game.js loadCustomPolicyIntoGame / the watchdog) and by App.jsx for
-    // the boot-time ?policy= request.
-    // { ref, name, status: "loading"|"active"|"error", error?, revertReason? }
+    // the boot-time ?move= request.
+    // { ref, name, status: "loading"|"active"|"error", error?, revertReason?,
+    //   kind?: "perpetual"|"episodic"|"script", slot?: "walk"|"sitstand"|"trick"|"script",
+    //   title?, author?, academy? (manifest.academy block) }
     customPolicy: null,
     padConnected: false,
     touchMode: false,

@@ -41,13 +41,20 @@ export default function App() {
     window.addEventListener("touchstart", armTouch, { once: true, passive: true });
     if (params.get("touch") === "1") armTouch();
 
-    // ?policy=<org/repo or .onnx URL>: request a community walk policy.
+    // ?move=<ref>: request a community move (Academy D7). ref is an
+    // "org/repo" Hub move, "session:<id>[:<round>]" (a private Academy run,
+    // served same-origin) or a direct .onnx URL. ?policy= is the legacy
+    // alias, and ?session=<id>[&round=<r>] is sugar for move=session:<id>:<r>.
     // Only the request is recorded here; the game loads it after boot
     // (never blocking it) and flips the status to active/error itself.
-    const policyRef = params.get("policy");
-    if (policyRef) {
+    let moveRef = params.get("move") || params.get("policy");
+    if (!moveRef && params.get("session")) {
+      const round = params.get("round");
+      moveRef = `session:${params.get("session")}${round ? `:${round}` : ""}`;
+    }
+    if (moveRef) {
       useGame.setState({
-        customPolicy: { ref: policyRef, name: policyRef, status: "loading" },
+        customPolicy: { ref: moveRef, name: moveRef, status: "loading" },
       });
     }
 
