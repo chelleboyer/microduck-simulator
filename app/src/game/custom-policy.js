@@ -316,7 +316,9 @@ export async function loadCustomPolicy(ref, { ort, onProgress = () => {} } = {})
   const slot = slotForManifest(manifest);
   const kind = manifest?.kind ?? "perpetual";
   const academy = manifest?.academy && typeof manifest.academy === "object" ? manifest.academy : null;
-  const title = academy?.prompt || manifest?.description || name;
+  // HUD plate text: the Academy prompt when there is one, else the name
+  // (descriptions are paragraphs, too long for the chip).
+  const title = academy?.prompt || name;
   const base = { kind, slot, name, title, author, academy, ref: String(ref), actionScale };
 
   if (slot === "script") {
