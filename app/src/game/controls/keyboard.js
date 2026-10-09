@@ -14,10 +14,12 @@ const KEYMAP = {
 // One-shot keys -> controller actions. Physical Q/E (A/E on AZERTY) are the
 // explicit left / right kicks, mirroring the pad's LB / RB; F alternates.
 // R sits (crouch-glide in roller mode - the game decides, same way the
-// roll action used to). Nothing dispatches "roll" any more.
+// roll action used to). Nothing dispatches "roll" any more. J is the
+// Jump Forward one-shot (same as the HUD button).
 const ACTION_KEYS = {
   KeyC: "chaseToggle",
   KeyG: "groundPick",
+  KeyJ: "jumpForward",
   KeyM: "locoToggle",
   KeyR: "sitToggle",
   KeyQ: "kickL",

@@ -1,5 +1,5 @@
 // App shell: layers in z order - scene canvas (1), halftone (2), CRT (5),
-// HUD + touch overlay (9-12), BIOS readout (20), title menu (30). Also owns
+// HUD + touch overlay + Jump Forward button (9-12), BIOS readout (20), title menu (30). Also owns
 // the pre-game device detection (gamepad, touch) and the title -> enter
 // flow. The title menu carries its own loading gate (single central
 // spinner), so no separate preboot veil.
@@ -8,6 +8,7 @@ import GameCanvas from "./scene/GameCanvas.jsx";
 import { Halftone, CrtOverlay } from "./ui/Overlays.jsx";
 import Hud from "./ui/Hud.jsx";
 import TouchOverlay from "./ui/TouchOverlay.jsx";
+import JumpButton from "./ui/JumpButton.jsx";
 import BiosOverlay from "./ui/BiosOverlay.jsx";
 import TitleMenu from "./ui/TitleMenu.jsx";
 import { useGame } from "./store.js";
@@ -82,6 +83,7 @@ export default function App() {
       <CrtOverlay />
       <Hud />
       <TouchOverlay />
+      <JumpButton />
       <BiosOverlay />
       <TitleMenu />
     </>

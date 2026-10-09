@@ -58,6 +58,9 @@ import {
 } from "./audio.js";
 import { createBallActor } from "./ball-actor.js";
 import { loadCustomPolicy as loadCustomPolicyModule, scriptCommandAt } from "./custom-policy.js";
+import {
+  JUMP_MOVE_REF, JUMP_ACTUATOR_LATENCY_SUBSTEPS, createJumpRunner, jumpPolicyProblem,
+} from "./jump.js";
 import { initGhosts } from "./ghosts.js";
 import { makeInfiniteGrid, makeArenaWalls } from "./arena.js";
 import { createBallVisual } from "./ball-visual.js";
@@ -378,7 +381,9 @@ async function boot({ scene, camera, renderer }) {
   let watchdogEvents = [];
 
   const actionScaleFor = (session) =>
-    (customPolicy && session === customPolicy.session ? customPolicy.actionScale : ACTION_SCALE);
+    (customPolicy && session === customPolicy.session ? customPolicy.actionScale
+      : jumpMove && session === jumpMove.session ? jumpMove.actionScale
+      : ACTION_SCALE);
 
   function revertCustomPolicy(revertReason = null) {
     if (!customPolicy) return;
@@ -440,6 +445,106 @@ async function boot({ scene, camera, renderer }) {
     } finally {
       policyLoadBusy = false;
     }
+  }
+
+  // ── Jump Forward slot (jump.js) ──────────────────────────────────────
+  // The hop policy is fetched from the Hub on the first press through the
+  // same validated loader as ?move=, then lives in its own sessions.jump
+  // slot: walk / sit / roll / kicks and any ?move= trick stay untouched.
+  // Failures stay visible in the store (jump.error) - the button never
+  // silently plays an official behavior instead.
+  const jumpRunner = createJumpRunner({ ctrlDt: CTRL_DT });
+  let jumpMove = null; // loadCustomPolicy result once the hop is mounted
+  const publishJump = () => setStore({ jump: jumpRunner.snapshot() });
+
+  async function loadJumpPolicy() {
+    publishJump();
+    try {
+      const loaded = await loadCustomPolicyModule(JUMP_MOVE_REF, { ort });
+      const problem = jumpPolicyProblem(loaded);
+      if (problem) throw new Error(problem);
+      jumpMove = loaded;
+      sessions.jump = loaded.session;
+      console.info(`[jump] mounted ${loaded.name} (${loaded.ref}), ${loaded.durationS} s episode`);
+      if (jumpRunner.policyLoaded(loaded.durationS) === "prepare") beginJumpPrep();
+    } catch (e) {
+      const msg = e instanceof TypeError
+        ? `could not reach the Hugging Face Hub (${e.message})`
+        : e?.message || String(e);
+      console.warn("[jump] policy load failed:", e);
+      jumpRunner.policyFailed(msg);
+    }
+    publishJump();
+  }
+
+  // A press (button, J key or rl.jumpForward). Legs only; mid one-shot
+  // presses are ignored rather than queued.
+  function jumpForward() {
+    if (loco !== "legs") return; // the button reads "Jump (legs only)"
+    const action = jumpRunner.request();
+    if (action === "load") loadJumpPolicy();
+    else if (action === "prepare") beginJumpPrep();
+    publishJump();
+  }
+
+  // Preparation starts from a stand: a sitting duck is stood up first by
+  // the sit policy; jumpStep() moves walk -> jumpprep once that is done.
+  function beginJumpPrep() {
+    if (mode === "sitstand") setMode("walk");
+  }
+
+  // Interrupt a jump in flight (reset, explosion, non-finite actions).
+  function abortJump(reason = null) {
+    const wasActive = mode === "jump" || mode === "jumpprep";
+    jumpRunner.abort(reason);
+    if (wasActive) {
+      mode = "walk";
+      lastAction.fill(0);
+    }
+    publishJump();
+  }
+
+  // Per-control-step jump state machine drive (after the physics step).
+  function jumpStep() {
+    const st = jumpRunner.status;
+    if (st !== "preparing" && st !== "jumping" && st !== "landing") return;
+    const gz = projGravZ();
+    if (st === "preparing" && mode === "walk" && loco === "legs" && !standTimer &&
+        !recovery && !inputLocked && postKickLock === 0) {
+      exitHeadMode();
+      mode = "jumpprep";
+      syncButtons();
+    }
+    if (mode === "jumpprep" && gz > -0.5) {
+      // Tipped while being held: hand the duck to the fall recovery.
+      abortJump("the duck tipped over before the jump");
+      syncButtons();
+      return;
+    }
+    const qvel = data.qvel;
+    const ev = jumpRunner.tick({
+      canPrepare: mode === "jumpprep",
+      onWalker: mode === "walk" && !recovery,
+      gz,
+      speed: Math.hypot(qvel[0], qvel[1]),
+      angSpeed: Math.hypot(qvel[3], qvel[4], qvel[5]),
+    });
+    if (!ev) return;
+    if (ev === "start") {
+      // Episode start, like the training reset: fresh action history.
+      mode = "jump";
+      lastAction.fill(0);
+      stickers?.pop("roll");
+      console.info("[jump] hop policy engaged");
+    } else if (ev === "land" || ev === "timeout") {
+      // Back to the standing walker (zero command until the next input).
+      // A landing that tipped the duck is picked up by the fall recovery.
+      if (mode === "jump" || mode === "jumpprep") mode = "walk";
+      lastAction.fill(0);
+      if (ev === "land") haptics.pulse("land");
+    }
+    syncButtons();
+    publishJump();
   }
 
   const doneCompile = bootLine("COMPILING PHYSICS");
@@ -525,7 +630,9 @@ async function boot({ scene, camera, renderer }) {
   let ball = null;
   let stickers = null; // comic popups, currently disabled
 
-  let mode = "walk"; // "walk" | "sitstand" | "roll" | "kickL" | "kickR" | "crouch" | "groundpick"
+  // "jumpprep" holds the duck still on the walker before a Jump Forward;
+  // "jump" runs the hop policy (jump.js).
+  let mode = "walk"; // "walk" | "sitstand" | "roll" | "kickL" | "kickR" | "crouch" | "groundpick" | "jumpprep" | "jump"
   let sitFlag = 0;
   const isKick = () => mode === "kickL" || mode === "kickR";
 
@@ -556,7 +663,8 @@ async function boot({ scene, camera, renderer }) {
   const ZERO_CMD = new Float32Array(3);
   function effectiveCmd() {
     if (inputLocked || headMode || mode === "roll" || mode === "crouch" ||
-        mode === "groundpick" || isKick() || postKickLock > 0 || recovery)
+        mode === "groundpick" || mode === "jumpprep" || mode === "jump" ||
+        isKick() || postKickLock > 0 || recovery)
       return ZERO_CMD;
     return controller.getCommand();
   }
@@ -663,6 +771,8 @@ async function boot({ scene, camera, renderer }) {
     recovery = null;
     fallDebounce = 0;
     mode = "walk";
+    jumpRunner.abort(null);
+    publishJump();
     // Head mode exits and its offsets DO reset here (the one place).
     headMode = false;
     padSource.headMode = false;
@@ -785,6 +895,13 @@ async function boot({ scene, camera, renderer }) {
     if (scriptRun && mode === "walk" && !recovery && customPolicy?.script) {
       scriptCommandAt(customPolicy.script, scriptRun.t, cmd);
     }
+    // Episodic policies (the Jump Forward hop, a ?move= trick) were
+    // trained with an all-zero command (manifest "command.encoding":
+    // "constant", idle zeros): no twist, head offsets or body slots leak
+    // in. The jump preparation zeroes it too so the walker stands still.
+    if (mode === "jump" || mode === "jumpprep" || (mode === "roll" && rollRun?.custom)) {
+      cmd.fill(0);
+    }
     for (let c = 0; c < CMD_SIZE; c++) obs[i++] = cmd[c];
     return obs;
   }
@@ -795,6 +912,7 @@ async function boot({ scene, camera, renderer }) {
   // get-up policy while it owns the duck.
   const activeSession = () => {
     if (recovery?.state === "recovering") return sessions.stand;
+    if (mode === "jumpprep") return sessions.walk;
     return sessions[loco === "rollers" && mode === "walk" ? "drive" : mode];
   };
 
@@ -957,6 +1075,10 @@ async function boot({ scene, camera, renderer }) {
     haptics.tick();
   }
 
+  // Pending targets of a delayed-actuation step (jump only, see above).
+  const delayedCtrl = new Float64Array(NUM_JOINTS);
+  let latency = 0;
+
   async function controlStep() {
     driveRelief(CTRL_DT); // kinematic terrain, written before the physics steps
     // Settle phase: ctrl frozen on the pose held at the fall (approximates
@@ -981,17 +1103,30 @@ async function boot({ scene, camera, renderer }) {
         if (customPolicy && session === customPolicy.session) {
           revertCustomPolicy("non-finite action tensor");
         }
+        if (mode === "jump" && jumpMove && session === jumpMove.session) {
+          abortJump("the jump policy produced non-finite actions");
+        }
       } else {
         const scale = actionScaleFor(session);
         lastAction.set(act);
         const ctrl = data.ctrl;
-        for (let j = 0; j < NUM_JOINTS; j++) ctrl[j] = DEFAULT_POSE[j] + act[j] * scale;
+        // The hop was trained with actuator latency (jump.js): the
+        // previous targets keep driving the servos for the first few
+        // substeps of the step. Every other policy stays at zero delay.
+        latency = mode === "jump" ? JUMP_ACTUATOR_LATENCY_SUBSTEPS : 0;
+        if (latency > 0) {
+          for (let j = 0; j < NUM_JOINTS; j++) delayedCtrl[j] = DEFAULT_POSE[j] + act[j] * scale;
+        } else {
+          for (let j = 0; j < NUM_JOINTS; j++) ctrl[j] = DEFAULT_POSE[j] + act[j] * scale;
+        }
       }
     }
     for (let s = 0; s < DECIMATION; s++) {
+      if (latency > 0 && s === latency) data.ctrl.set(delayedCtrl);
       applyGrabForce(); // mouse perturbation, fresh velocity every substep
       mujoco.mj_step(model, data);
     }
+    latency = 0;
     stepAudioSim(); // footsteps / rumble / ball thumps off the fresh state
 
     // Command script clock: 50 Hz like everything here. A non-looping
@@ -1020,6 +1155,7 @@ async function boot({ scene, camera, renderer }) {
       // one driving (its slot: walk, sitstand or the trick one-shot);
       // official one-shots and rollers never count.
       if (loco === "legs" && customDriving()) watchdogAbnormalEnd("exploded");
+      if (mode === "jump") abortJump("the physics solver diverged during the jump");
       resetSim();
     } else if (recovery) {
       // Recovery state machine owns the duck: settle -> stand policy ->
@@ -1063,7 +1199,9 @@ async function boot({ scene, camera, renderer }) {
       } else {
         fallDebounce = 0;
         const now = performance.now();
-        const graceMs = mode === "roll" ? 5000 : 1000;
+        // The hop may tip hard on a rough landing and still recover inside
+        // its own episode (it hands to the fall recovery when it ends).
+        const graceMs = mode === "roll" || mode === "jump" ? 5000 : 1000;
         // First frame of a non-recoverable fall (rollers, sit, one-shots):
         // same haptic thud, once - fallenSince latches until reset/upright.
         if (fallenSince == null) haptics.pulse("fall");
@@ -1151,6 +1289,8 @@ async function boot({ scene, camera, renderer }) {
         syncButtons();
       }
     }
+
+    jumpStep();
   }
 
   // ── Relief (prototype: the level itself gains gentle slopes) ────────
@@ -1303,7 +1443,7 @@ async function boot({ scene, camera, renderer }) {
     if (name !== "legs" && name !== "rollers") return;
     if (loco === name || locoSwitching) return;
     if (!force && (inputLocked || rollRun || kickRun || crouchRun || pickRun ||
-        standTimer || recovery)) return;
+        standTimer || recovery || mode === "jump" || mode === "jumpprep")) return;
     locoSwitching = true;
     setStore({ locoSwitching: true });
     try {
@@ -1960,6 +2100,7 @@ async function boot({ scene, camera, renderer }) {
   controller.on("locoToggle", () => toggleLoco());
   controller.on("roll", ({ source }) => triggerRoll(srcTag(source)));
   controller.on("groundPick", ({ source }) => triggerGroundPick(srcTag(source)));
+  controller.on("jumpForward", () => jumpForward());
   controller.on("kickL", ({ source }) => triggerKick("left", srcTag(source)));
   controller.on("kickR", ({ source }) => triggerKick("right", srcTag(source)));
   controller.on("alternateKick", ({ source }) => {
@@ -2015,6 +2156,7 @@ async function boot({ scene, camera, renderer }) {
     // return to walk - switching now would floor the duck. Same while the
     // fall-recovery state machine owns the duck.
     if (recovery) return;
+    if (mode === "jump" || mode === "jumpprep") return;
     if ((mode === "roll" && rollRun) || (isKick() && kickRun) ||
         (mode === "crouch" && crouchRun) || (mode === "groundpick" && pickRun)) return;
     if (next === "sit" && loco === "rollers") return;
@@ -2135,6 +2277,7 @@ async function boot({ scene, camera, renderer }) {
     const label =
       recovery ? "Recovery"
       : mode === "roll" ? (rollRun?.custom ? "Trick" : "Roll")
+      : mode === "jump" || mode === "jumpprep" ? "Jump"
       : scriptRun ? "Script"
       : mode === "crouch" ? "Crouch"
       : mode === "groundpick" ? "Pick"
@@ -2166,6 +2309,7 @@ async function boot({ scene, camera, renderer }) {
     startEntrance: () => ceremony.startEntrance(),
     loadCustomPolicy: (ref) => loadCustomPolicyIntoGame(ref),
     clearCustomPolicy: () => revertCustomPolicy(),
+    jumpForward: () => jumpForward(),
   });
 
   // Deterministic hooks for automated verification (rAF pauses in
@@ -2184,6 +2328,8 @@ async function boot({ scene, camera, renderer }) {
     clearCustomPolicy: revertCustomPolicy,
     get customPolicy() { return customPolicy; },
     get scriptRun() { return scriptRun; },
+    jumpForward,
+    get jump() { return { ...jumpRunner.snapshot(), steps: jumpRunner.steps, jumpSteps: jumpRunner.jumpSteps }; },
     toggleScript,
     get watchdogEvents() { return watchdogEvents.slice(); },
     get loco() { return loco; },

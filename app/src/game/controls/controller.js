@@ -72,6 +72,7 @@
 // ── Actions ──────────────────────────────────────────────────────────────
 //   roll          one-shot roll (crouch-glide in roller mode; game decides)
 //   groundPick    one-shot ground pick cycle (pad A / keyboard G)
+//   jumpForward   one-shot community hop (keyboard J / HUD button)
 //   kickL, kickR  one-shot kicks, explicit foot
 //   alternateKick one-shot kick, feet alternated by the game
 //   spawnBall     pop / respawn the kickable ball (no bound key; game/API)
