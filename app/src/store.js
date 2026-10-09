@@ -36,6 +36,10 @@ export const useGame = create(
     //   kind?: "perpetual"|"episodic"|"script", slot?: "walk"|"sitstand"|"trick"|"script",
     //   title?, author?, academy? (manifest.academy block) }
     customPolicy: null,
+    // Jump Forward slot (game/jump.js): status is idle | loading | ready |
+    // preparing | jumping | landing | error; error = last failure or abort
+    // reason (shown under the button), jumps = completed hops.
+    jump: { status: "idle", error: null, jumps: 0 },
     padConnected: false,
     touchMode: false,
     ballActive: false,

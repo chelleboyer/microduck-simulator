@@ -29,6 +29,7 @@ policies are lazy-loaded on the first switch.
 | Kick | `ball_kick_left.onnx` / `ball_kick_right.onnx` | Blind one-shot kick (0.5 s window, zeroed commands), left or right leg |
 | Drive (rollers) | `BEST_roller.onnx` | Velocity-tracking skating on 4 passive wheels (higher top speed: 0.6 m/s) |
 | Crouch (rollers) | `BEST_roller_crouch.onnx` | One-shot crouch-glide: sinks low over ~3.5 s and stands back up (phase-encoded command) |
+| Jump Forward (legs) | [`chelleboyer/microduck-hop-once`](https://huggingface.co/chelleboyer/microduck-hop-once) | One forward hop, then stand. Fetched from the Hub on the first press; see below |
 
 Policies and MJCF model from
 [pollen-robotics/microduck](https://github.com/pollen-robotics/microduck)
@@ -42,6 +43,7 @@ and [pollen-robotics/microduck_rl](https://github.com/pollen-robotics/microduck_
 - F: alternate left / right kicks (legs only)
 - R: sit / stand (legs) / crouch-glide (rollers)
 - G: ground pick (legs only)
+- J or the **Jump Forward** button: one forward hop (legs only)
 - C: toggle the chase camera (on by default; dragging detaches it)
 - Space: reset
 - Drag to orbit, scroll to zoom
@@ -49,6 +51,32 @@ and [pollen-robotics/microduck_rl](https://github.com/pollen-robotics/microduck_
 
 In roller mode the legs-only actions (kicks, sit) are disabled and their
 hints fade out; play the ball by driving into it.
+
+### Jump Forward
+
+The **Jump Forward** button (bottom centre on desktop, above the A/B caps
+on touch screens) plays the community episodic policy
+[`chelleboyer/microduck-hop-once`](https://huggingface.co/chelleboyer/microduck-hop-once)
+once per press. It loads through the same validated community-move loader as
+`?move=` (manifest checks + ONNX smoke run) but mounts in its own slot, so
+walking, sitting, rolling, kicks and any `?move=` trick are untouched:
+
+1. **Loading**: the first press downloads `manifest.json` + `policy.onnx`
+   from the Hub. Failures (network/CORS, missing file, incompatible
+   manifest, broken ONNX) print under the button with a **Retry** - no
+   stock behavior is substituted.
+2. **Preparing**: the walking policy holds the duck still (zero command;
+   a sitting duck is stood up first) until it is upright and settled.
+3. **Jumping**: the hop policy drives for its manifest duration (3.0 s),
+   all-zero command, fresh action history.
+4. **Landing**: control returns to the standing walker (or the fall
+   recovery after a rough landing); the button re-arms once the duck has
+   been upright for 0.5 s.
+
+The hop was trained with a 3-5 physics-substep actuator delay. The playground
+applies a 3-substep delay **only while the hop policy drives**: with zero
+delay the same network produces a ~3 cm shuffle instead of a hop. Every
+other policy keeps the zero-delay actuation.
 
 ### URL parameters
 
